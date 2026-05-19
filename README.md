@@ -1,9 +1,9 @@
 # Double Buffer SIGReg (DB-SIGReg) 🔄
 > **Memory-Efficient Distribution Matching for Self-Supervised Learning**
 
-*Status: Theoretical whitepaper available. PyTorch implementation in progress.*
+*Status: Theoretical whitepaper available. Minimal PyTorch implementation available.*
 
-DB-SIGReg is a proposed regularization module that brings the stability of massive-batch distribution matching to single-GPU training environments. It builds upon the Sketched Isotropic Gaussian Regularization (SIGReg) introduced in LeJEPA, utilizing temporal aggregation and a double-buffered projection mechanism to decouple memory constraints from statistical validity.
+DB-SIGReg is a proposed regularization module that brings the stability of big batch distribution matching to small batches. It builds upon the Sketched Isotropic Gaussian Regularization (SIGReg) introduced in LeJEPA, utilizing temporal aggregation and a double-buffered projection mechanism to decouple memory constraints from statistical validity.
 
 📄 **[Read the theoretical whitepaper draft here](db_sigreg.pdf)**
 
@@ -11,7 +11,7 @@ DB-SIGReg is a proposed regularization module that brings the stability of massi
 Self-supervised architectures utilizing empirical characteristic function tests (like Epps-Pulley) force latent representations to form an isotropic Gaussian. Because computing this in high dimensions is hard, embeddings are projected onto random 1D axes (Cramér-Wold theorem).
 
 This creates a severe optimization contradiction:
-1. **To get stable statistics:** You need massive batch sizes ($B \ge 4096$).
+1. **To get stable statistics:** You need big batch sizes.
 2. **To use an EMA instead of big batches:** The 1D projection axes must remain *fixed* over time. 
 3. **The Null Space Trap:** If the projection axes are fixed, the neural network acts adversarially, hiding collapsed representations in the geometric null space between selected axes. The axes *must* be constantly re-sampled, which instantly invalidates the EMA.
 
@@ -23,48 +23,76 @@ DB-SIGReg imports the concept of double buffering from systems engineering into 
 
 After $K$ steps, the Active Buffer is discarded, the Shadow Buffer is promoted to Active, and a new Shadow Buffer is spun up. **Result: The axes rotate to prevent dimensional collapse, but the network never experiences instability from low batch size.**
 
-## 🛠️ Implementation Preview (WIP)
+## 🛠️ Minimal Implementation
 
-The full PyTorch training loop and module are currently being implemented. The core mechanism decoupling the gradient graph from the shadow EMA will follow this conceptual structure:
+This repository now contains a compact experiment harness:
 
-```python
-import torch
-import torch.nn as nn
+- `src/db_sigreg/regularizers.py`: LeJEPA-style `SIGReg` baseline and the detached `DoubleBufferSIGReg` pseudo-loss.
+- `src/db_sigreg/models.py`: small CNN, ResNet-18, and tiny ViT encoders with an online linear probe.
+- `src/db_sigreg/data.py`: CIFAR-10, CIFAR-100, STL-10, and fake-data loaders with multi-view SSL augmentations.
+- `src/db_sigreg/train.py`: training loop, gradient accumulation, TensorBoard logging, checkpoints, and throughput/memory metrics.
 
-class DoubleBufferSIGReg(nn.Module):
+### Smoke test
 
-    def forward(self, z):
-        # 1. ACTIVE BUFFER (Gradient Path)
-        z_active = z @ self.active_proj
-        # ... Compute loss against Target Gaussian using active buffer  ...
-        
-        # 2. SHADOW BUFFER (Silent Warm-up)
-        with torch.no_grad():
-            z_shadow = z @ self.shadow_proj
-            # ... Silently aggregate frequencies to mature the shadow buffer ...
-            
-        # 3. SWAP MECHANISM
-        self.current_step += 1
-        if self.current_step >= self.swap_steps:
-            self._swap_buffers() # Promote shadow to active, spin up new shadow
-            
-        return loss
+```bash
+uv run db-sigreg --dataset fake --epochs 1 --limit-train 128 --limit-eval 64 --batch-size 16 --accum-steps 2 --num-workers 0 --device cuda
 ```
+
+### First real validation on a small GPU
+
+```bash
+uv run db-sigreg --dataset cifar10 --backbone cnn --loss dbsigreg --epochs 20 --batch-size 64 --accum-steps 4 --image-size 64
+```
+
+Compare against direct SIGReg under the same memory envelope:
+
+```bash
+uv run db-sigreg --dataset cifar10 --backbone cnn --loss sigreg --epochs 20 --batch-size 64 --accum-steps 4 --image-size 64
+```
+
+Note that `--accum-steps` on direct SIGReg does not make it equivalent to a
+single virtual-batch ECF loss: it accumulates gradients from squared mini-batch
+ECF errors. DB-SIGReg instead uses fixed projection axes and detached
+window-level statistics from the previous buffer, so the optimization dynamics
+are intentionally different.
+
+You can also test a less independent but less stale variant that temporarily
+combines the active context with the current mini-batch for the loss. The
+current batch is not appended to the active buffer; it only warms the shadow
+buffer for the next swap.
+
+```bash
+uv run db-sigreg --dataset cifar10 --backbone cnn --loss dbsigreg --db-stat-mode include_current --epochs 20 --batch-size 128 --accum-steps 4 --swap-steps 3 --image-size 64
+```
+
+Open TensorBoard:
+
+```bash
+uv run tensorboard --logdir runs
+```
+
+Useful metrics:
+
+- `eval/probe_acc`: quick representation-quality proxy.
+- `train/sigreg_metric`: mature active-buffer ECF error for DB-SIGReg, direct ECF statistic for SIGReg.
+- `train/sigreg_ecf_error`: count-normalized ECF error; use this when comparing DB-SIGReg virtual batches against mini-batch SIGReg.
+- `train/sigreg_optimization_loss`: signed detached pseudo-loss used for DB-SIGReg gradients.
+- `buffer/loss_count`: projected sample count used by the current loss, including temporary current-batch stats.
+- `perf/samples_per_sec`, `perf/iter_time_sec`, `perf/peak_memory_mb`: speed and memory comparison.
+- `buffer/active_count`, `buffer/shadow_count`, `buffer/swaps`, `buffer/mature`: DB-SIGReg buffer health.
 
 ## 🚀 Roadmap / Next Steps
 - [x] Formulate math and architectural geometry.
 - [x] Publish initial whitepaper draft.
-- [ ] **[In Progress]** Implement PyTorch module with `.detach()` shadow updates.
-- [ ] Run empirical baseline on small-scale datasets.
-- [ ] Ablation study: Swap frequency ($K$) vs. dimensional collapse.
-- [ ] Ablation study: EMA vs. CMA for shadow buffer.
+- [x] Implement PyTorch module with `.detach()` shadow updates.
+- [x] Run empirical baseline on small-scale datasets.
 
 ## 📖 Citation
 If you find this theoretical framework useful, please consider citing:
 ```bibtex
 @article{db_sigreg_2026,
-  title={Double-Buffered Random Projections for Memory-Efficient Distribution Matching in Self-Supervised Learning},
-  author={[Your Name]},
+  title={Double-Buffered SIGReg},
+  author={Aurélien Cecille},
   year={2026},
   publisher={GitHub}
 }

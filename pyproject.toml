@@ -1,0 +1,24 @@
+[project]
+name = "db-sigreg"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "tensorboard>=2.20.0",
+    "torch==2.12.0+cu126",
+    "torchvision==0.27.0+cu126",
+]
+
+[project.scripts]
+db-sigreg = "db_sigreg.train:main"
+
+[build-system]
+requires = ["setuptools>=70.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu126"
