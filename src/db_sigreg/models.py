@@ -71,10 +71,14 @@ class SmallConvEncoder(nn.Module):
 
 
 class ResNet18Encoder(nn.Module):
-    def __init__(self, emb_dim: int = 512, norm: Norm = "bn") -> None:
+    def __init__(self, emb_dim: int = 512, norm: Norm = "bn", cifar_stem: bool = False) -> None:
         super().__init__()
         norm_layer = None if norm == "bn" else (lambda c: _norm2d("gn", c))
         model = resnet18(weights=None, norm_layer=norm_layer)
+        if cifar_stem:
+            # 3x3 stride-1 stem without max-pool: the ImageNet stem shrinks 32 px inputs to 1x1 by the last stage.
+            model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            model.maxpool = nn.Identity()
         model.fc = nn.Identity()
         self.backbone = model
         self.proj = nn.Linear(512, emb_dim) if emb_dim != 512 else nn.Identity()
@@ -137,8 +141,8 @@ class SSLModel(nn.Module):
         super().__init__()
         if backbone == "cnn":
             self.encoder = SmallConvEncoder(emb_dim=emb_dim, norm=norm)
-        elif backbone == "resnet18":
-            self.encoder = ResNet18Encoder(emb_dim=emb_dim, norm=norm)
+        elif backbone in ("resnet18", "resnet18_cifar"):
+            self.encoder = ResNet18Encoder(emb_dim=emb_dim, norm=norm, cifar_stem=backbone == "resnet18_cifar")
         elif backbone == "tiny_vit":
             self.encoder = TinyViTEncoder(image_size=image_size, emb_dim=emb_dim)
         else:

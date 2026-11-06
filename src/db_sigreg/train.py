@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("results/runs.jsonl"),
         help="Tracked JSONL file; one summary line is appended per finished run.",
     )
-    parser.add_argument("--backbone", choices=["cnn", "resnet18", "tiny_vit"], default="cnn")
+    parser.add_argument("--backbone", choices=["cnn", "resnet18", "resnet18_cifar", "tiny_vit"], default="cnn")
     parser.add_argument("--loss", choices=["dbsigreg", "sigreg"], default="dbsigreg")
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--views", type=int, default=2, help="Global views per image.")
