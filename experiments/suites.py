@@ -25,7 +25,17 @@ RESULTS = ROOT / "results" / "runs.jsonl"
 
 # Shared defaults: native 32 px resolution, small CNN, 5 knots. The dataset is
 # chosen per suite (DEFAULT_DATASET) or with --dataset, and is part of run names.
+# Training recipe from the 2026-11-06 recipe search (CIFAR-100, 20 epochs):
+# warmup+cosine lr, 2 global + 6 local crops, projector output 16 and 1024
+# axes took the probe from 16.9% to 35.4% (random-init encoder: 14.4%).
+RECIPE = "r2"  # part of run names, so results from older recipes are never skipped as done
 BASE = [
+    "--lr-schedule", "cosine",
+    "--views", "2",
+    "--local-views", "6",
+    "--global-scale", "0.3", "1.0",
+    "--proj-dim", "16",
+    "--axes", "1024",
     "--backbone", "cnn",
     "--image-size", "32",
     "--knots", "5",
@@ -180,7 +190,7 @@ def main() -> None:
         epochs = args.epochs or DEFAULT_EPOCHS[suite]
         dataset = args.dataset or DEFAULT_DATASET[suite]
         for name, run_args in SUITES[suite](seeds):
-            name = f"{name}-{SHORT[dataset]}"
+            name = f"{name}-{SHORT[dataset]}-{RECIPE}"
             if name in finished:
                 print(f"skip {name} (already in {RESULTS.relative_to(ROOT)})")
                 continue
