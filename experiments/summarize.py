@@ -44,7 +44,7 @@ def main() -> None:
         tag = run.get("tag") or "untagged"
         if wanted and tag not in wanted:
             continue
-        variant = re.sub(r"-s\d+$", "", run["config"]["name"] or run["run"])
+        variant = re.sub(r"-s\d+(?=-|$)", "", run["config"]["name"] or run["run"])
         groups[tag][variant].append(run)
 
     for tag, variants in groups.items():

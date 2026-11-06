@@ -83,7 +83,7 @@ Useful metrics:
 
 ### Experiment suites
 
-`experiments/suites.py` runs the paper's experiments on CIFAR-10 (32 px, small CNN, 5 knots).
+`experiments/suites.py` runs the paper's experiments at 32 px with the small CNN and 5 knots: CIFAR-100 for the accuracy suites, CIFAR-10 for `fidelity` (override with `--dataset`).
 Every finished run appends a summary line to `results/runs.jsonl`, which is tracked in git,
 and runs already listed there are skipped on restart.
 

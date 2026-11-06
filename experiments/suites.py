@@ -23,9 +23,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "results" / "runs.jsonl"
 
-# Shared defaults: CIFAR-10 at native resolution, small CNN, 5 knots.
+# Shared defaults: native 32 px resolution, small CNN, 5 knots. The dataset is
+# chosen per suite (DEFAULT_DATASET) or with --dataset, and is part of run names.
 BASE = [
-    "--dataset", "cifar10",
     "--backbone", "cnn",
     "--image-size", "32",
     "--knots", "5",
@@ -120,6 +120,10 @@ SUITES = {
     "nullspace": nullspace,
 }
 DEFAULT_SEEDS = {"premise": [0], "fidelity": [0], "smallbatch": [0], "main": [0, 1, 2], "nullspace": [0]}
+# Accuracy suites use CIFAR-100 (less saturated probe). Fidelity measures gradient
+# agreement, which does not depend on the label set, so CIFAR-10 is enough there.
+DEFAULT_DATASET = {"premise": "cifar100", "fidelity": "cifar10", "smallbatch": "cifar100", "main": "cifar100", "nullspace": "cifar100"}
+SHORT = {"cifar10": "c10", "cifar100": "c100", "stl10": "stl10", "fake": "fake"}
 DEFAULT_EPOCHS = {"premise": 20, "fidelity": 5, "smallbatch": 20, "main": 30, "nullspace": 20}
 
 
@@ -140,6 +144,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--epochs", type=int, default=None, help="Override the suite's default epoch count.")
     parser.add_argument("--seeds", type=int, nargs="+", default=None)
+    parser.add_argument("--dataset", choices=list(SHORT), default=None, help="Override the suite's default dataset.")
     parser.add_argument("--num-workers", type=int, default=4)
     args, extra = parser.parse_known_args()  # unknown flags are passed to every run
 
@@ -156,12 +161,14 @@ def main() -> None:
     for suite in args.suites:
         seeds = args.seeds or DEFAULT_SEEDS[suite]
         epochs = args.epochs or DEFAULT_EPOCHS[suite]
+        dataset = args.dataset or DEFAULT_DATASET[suite]
         for name, run_args in SUITES[suite](seeds):
+            name = f"{name}-{SHORT[dataset]}"
             if name in finished:
                 print(f"skip {name} (already in {RESULTS.relative_to(ROOT)})")
                 continue
             cmd = [
-                sys.executable, "-m", "db_sigreg.train", *BASE, *run_args,
+                sys.executable, "-m", "db_sigreg.train", "--dataset", dataset, *BASE, *run_args,
                 "--epochs", str(epochs), "--name", name, "--tag", suite,
                 "--num-workers", str(args.num_workers), *extra,
             ]
