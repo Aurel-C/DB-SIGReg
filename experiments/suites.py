@@ -119,13 +119,13 @@ def main_comparison(seeds: list[int]) -> list[tuple[str, list[str]]]:
 
 
 def nullspace(seeds: list[int]) -> list[tuple[str, list[str]]]:
-    """Fixed vs rotating axes, with 16 and 128 axes on a 64-dim projector output.
+    """Fixed vs rotating axes, with 4 and 64 axes on the 16-dim projector output.
 
     A null space only exists when there are fewer axes than dimensions.
     """
     runs = []
     for seed in seeds:
-        for axes in (16, 128):
+        for axes in (4, 64):
             common = ["--axes", str(axes), "--batch-size", "64", "--accum-steps", "4", "--seed", str(seed)]
             runs += [
                 (f"nullspace-sigreg-rotate-a{axes}-s{seed}", ["--loss", "sigreg", "--sigreg-refresh", "4", *common]),

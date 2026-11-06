@@ -100,7 +100,7 @@ uv run python experiments/summarize.py                   # Markdown tables per s
 | `fidelity` | How close are the DB-SIGReg and mini-batch SIGReg gradients to the exact window gradient? |
 | `smallbatch` | SIGReg vs DB-SIGReg with micro-batches of 2 to 32 at 256 images per step, with batch-independent norms (`--norm gn`). |
 | `main` | Equal memory (64 × 4) comparison against a true batch-256 SIGReg ceiling, 3 seeds. |
-| `nullspace` | Fixed vs rotating axes, and DB swap intervals, with 16 and 128 axes on a 64-dim projector. |
+| `nullspace` | Fixed vs rotating axes, and DB swap intervals, with 4 and 64 axes on the 16-dim projector. |
 
 The gradient-fidelity diagnostic (`--fidelity-every N`, DB-SIGReg only) computes the exact
 large-batch gradient of the window in two passes with micro-batch memory, and logs the cosine
