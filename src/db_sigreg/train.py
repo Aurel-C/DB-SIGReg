@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument(
+        "--total-steps",
+        type=int,
+        default=None,
+        help="Train for this many optimizer steps instead of --epochs (fixed-steps control).",
+    )
     parser.add_argument("--limit-train", type=int, default=None)
     parser.add_argument("--limit-eval", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -161,6 +167,8 @@ def train_one_epoch(
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             tracker["optimizer_steps"] += 1
+            if args.total_steps and tracker["optimizer_steps"] >= args.total_steps:
+                break
             if (
                 fidelity_stream is not None
                 and isinstance(regularizer, DoubleBufferSIGReg)
@@ -425,6 +433,10 @@ def main() -> None:
     }
     history: list[dict[str, float]] = []
     start_time = time.time()
+    if args.total_steps:
+        steps_per_epoch = max(len(train_loader) // args.accum_steps, 1)
+        args.epochs = math.ceil(args.total_steps / steps_per_epoch)
+        print(f"Fixed {args.total_steps} optimizer steps -> {args.epochs} epochs")
     global_step = 0
     best_acc = -math.inf
     try:
@@ -445,7 +457,8 @@ def main() -> None:
                 tracker=tracker,
                 fidelity_stream=fidelity_stream,
             )
-            if epoch % args.eval_every == 0 or epoch == args.epochs:
+            done = bool(args.total_steps) and tracker["optimizer_steps"] >= args.total_steps
+            if epoch % args.eval_every == 0 or epoch == args.epochs or done:
                 metrics = evaluate(
                     model, eval_loader, writer, device, amp_enabled, amp_dtype, epoch, metric_axes, metric_reg
                 )
@@ -466,6 +479,8 @@ def main() -> None:
                 "best_acc": best_acc,
             }
             torch.save(checkpoint, run_dir / "last.pt")
+            if done:
+                break
     finally:
         writer.close()
 

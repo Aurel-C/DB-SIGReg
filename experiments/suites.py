@@ -41,6 +41,20 @@ def premise(seeds: list[int]) -> list[tuple[str, list[str]]]:
     return runs
 
 
+def premise_steps(seeds: list[int]) -> list[tuple[str, list[str]]]:
+    """Premise with a fixed optimizer-step budget (7800 steps, bs128's 20 epochs) to remove the step-count confound."""
+    runs = []
+    for seed in seeds:
+        for bs in (32, 64, 128, 256, 512):
+            runs.append(
+                (
+                    f"premise-steps-sigreg-bs{bs}-s{seed}",
+                    ["--loss", "sigreg", "--batch-size", str(bs), "--total-steps", "7800", "--seed", str(seed)],
+                )
+            )
+    return runs
+
+
 def fidelity(seeds: list[int]) -> list[tuple[str, list[str]]]:
     """Cosine similarity of DB / DB-fresh / mini-batch gradients to the exact window gradient."""
     runs = []
@@ -116,17 +130,18 @@ def nullspace(seeds: list[int]) -> list[tuple[str, list[str]]]:
 
 SUITES = {
     "premise": premise,
+    "premise_steps": premise_steps,
     "fidelity": fidelity,
     "smallbatch": smallbatch,
     "main": main_comparison,
     "nullspace": nullspace,
 }
-DEFAULT_SEEDS = {"premise": [0], "fidelity": [0], "smallbatch": [0], "main": [0, 1, 2], "nullspace": [0]}
+DEFAULT_SEEDS = {"premise": [0], "premise_steps": [0], "fidelity": [0], "smallbatch": [0], "main": [0, 1, 2], "nullspace": [0]}
 # Accuracy suites use CIFAR-100 (less saturated probe). Fidelity measures gradient
 # agreement, which does not depend on the label set, so CIFAR-10 is enough there.
-DEFAULT_DATASET = {"premise": "cifar100", "fidelity": "cifar10", "smallbatch": "cifar100", "main": "cifar100", "nullspace": "cifar100"}
+DEFAULT_DATASET = {"premise": "cifar100", "premise_steps": "cifar100", "fidelity": "cifar10", "smallbatch": "cifar100", "main": "cifar100", "nullspace": "cifar100"}
 SHORT = {"cifar10": "c10", "cifar100": "c100", "stl10": "stl10", "fake": "fake"}
-DEFAULT_EPOCHS = {"premise": 20, "fidelity": 5, "smallbatch": 20, "main": 30, "nullspace": 20}
+DEFAULT_EPOCHS = {"premise": 20, "premise_steps": 1, "fidelity": 5, "smallbatch": 20, "main": 30, "nullspace": 20}
 
 
 def done_runs() -> set[str]:
