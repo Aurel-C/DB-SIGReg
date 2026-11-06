@@ -10,7 +10,8 @@ aspect ratio is clamped instead of resampled; both are standard GPU-pipeline
 simplifications.
 
 Batches have the same shape as the CPU DataLoader: (views, labels) with views
-of shape (B, V, 3, S, S).
+of shape (B, V, 3, S, S). With local_views > 0 (multi-crop), views is a tuple
+(global (B, V, 3, S, S), local (B, L, 3, s, s)).
 """
 
 from __future__ import annotations
@@ -56,12 +57,20 @@ class GPUViewLoader:
         train: bool,
         device: torch.device,
         seed: int = 0,
+        global_scale: tuple[float, float] = (0.2, 1.0),
+        local_views: int = 0,
+        local_size: int = 16,
+        local_scale: tuple[float, float] = (0.05, 0.3),
     ) -> None:
         self.images = images.to(device).permute(0, 3, 1, 2).contiguous()  # (N, 3, H, W) uint8
         self.labels = labels.to(device)
         self.batch_size = batch_size
         self.views = views
         self.image_size = image_size
+        self.global_scale = global_scale
+        self.local_views = local_views
+        self.local_size = local_size
+        self.local_scale = local_scale
         self.train = train
         self.device = device
         self.generator = torch.Generator(device=device).manual_seed(seed)
@@ -83,9 +92,14 @@ class GPUViewLoader:
             idx = order[i * self.batch_size : (i + 1) * self.batch_size]
             x = self.images[idx].float().div_(255.0)
             if self.train:
-                x = x.repeat_interleave(self.views, dim=0)
-                x = self._augment(x)
-                x = x.view(idx.numel(), self.views, 3, self.image_size, self.image_size)
+                b = idx.numel()
+                g = self._augment(x.repeat_interleave(self.views, dim=0), self.image_size, self.global_scale)
+                g = g.view(b, self.views, 3, self.image_size, self.image_size)
+                if self.local_views:
+                    loc = self._augment(x.repeat_interleave(self.local_views, dim=0), self.local_size, self.local_scale)
+                    yield (g, loc.view(b, self.local_views, 3, self.local_size, self.local_size)), self.labels[idx]
+                    continue
+                x = g
             else:
                 if x.shape[-1] != self.image_size:
                     x = F.interpolate(x, size=self.image_size, mode="bilinear", antialias=True, align_corners=False)
@@ -95,10 +109,10 @@ class GPUViewLoader:
     def _rand(self, n: int, low: float = 0.0, high: float = 1.0) -> Tensor:
         return torch.rand(n, device=self.device, generator=self.generator) * (high - low) + low
 
-    def _augment(self, x: Tensor) -> Tensor:
+    def _augment(self, x: Tensor, size: int, scale: tuple[float, float]) -> Tensor:
         n = x.shape[0]
         # RandomResizedCrop(scale=(0.2, 1.0), ratio=(3/4, 4/3)) + horizontal flip, as one affine warp.
-        area = self._rand(n, 0.2, 1.0)
+        area = self._rand(n, *scale)
         log_ratio = self._rand(n, math.log(3 / 4), math.log(4 / 3))
         ratio = log_ratio.exp()
         w = (area * ratio).sqrt().clamp(max=1.0)
@@ -111,7 +125,7 @@ class GPUViewLoader:
         theta[:, 0, 2] = cx
         theta[:, 1, 1] = h
         theta[:, 1, 2] = cy
-        grid = F.affine_grid(theta, [n, 3, self.image_size, self.image_size], align_corners=False)
+        grid = F.affine_grid(theta, [n, 3, size, size], align_corners=False)
         x = F.grid_sample(x, grid, mode="bilinear", padding_mode="reflection", align_corners=False)
 
         # ColorJitter(0.4, 0.4, 0.4, 0.1) with p=0.8.
@@ -156,6 +170,10 @@ def build_gpu_loaders(
     download: bool,
     device: torch.device,
     seed: int,
+    global_scale: tuple[float, float] = (0.2, 1.0),
+    local_views: int = 0,
+    local_size: int = 16,
+    local_scale: tuple[float, float] = (0.05, 0.3),
 ) -> tuple[GPUViewLoader, GPUViewLoader, int, int, int]:
     """Returns train loader, eval loader, num classes, train size, eval size."""
 
@@ -167,7 +185,18 @@ def build_gpu_loaders(
         eval_x, eval_y = eval_x[:limit_eval], eval_y[:limit_eval]
     classes = 10 if name == "cifar10" else 100
     train = GPUViewLoader(
-        train_x, train_y, batch_size=batch_size, views=views, image_size=image_size, train=True, device=device, seed=seed
+        train_x,
+        train_y,
+        batch_size=batch_size,
+        views=views,
+        image_size=image_size,
+        train=True,
+        device=device,
+        seed=seed,
+        global_scale=global_scale,
+        local_views=local_views,
+        local_size=local_size,
+        local_scale=local_scale,
     )
     evaluation = GPUViewLoader(
         eval_x, eval_y, batch_size=eval_batch_size, views=1, image_size=image_size, train=False, device=device

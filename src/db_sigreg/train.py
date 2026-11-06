@@ -36,7 +36,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone", choices=["cnn", "resnet18", "tiny_vit"], default="cnn")
     parser.add_argument("--loss", choices=["dbsigreg", "sigreg"], default="dbsigreg")
     parser.add_argument("--image-size", type=int, default=64)
-    parser.add_argument("--views", type=int, default=2)
+    parser.add_argument("--views", type=int, default=2, help="Global views per image.")
+    parser.add_argument("--global-scale", type=float, nargs=2, default=(0.2, 1.0), help="RandomResizedCrop scale of global views.")
+    parser.add_argument("--local-views", type=int, default=0, help="Extra small multi-crop views (GPU data only).")
+    parser.add_argument("--local-size", type=int, default=16)
+    parser.add_argument("--local-scale", type=float, nargs=2, default=(0.05, 0.3))
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=20)
@@ -151,12 +155,20 @@ def train_one_epoch(
     steps_since_log = 0
 
     for step, (views, labels) in enumerate(train_loader, start=1):
-        views = views.to(device, non_blocking=True)
+        if isinstance(views, (tuple, list)):
+            global_views, local_views = views
+        else:
+            global_views, local_views = views.to(device, non_blocking=True), None
         labels = labels.to(device, non_blocking=True)
 
         with autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-            emb, proj = model(views)
-            inv_loss = (proj - proj.mean(dim=1, keepdim=True)).square().mean()
+            emb, proj = model(global_views)
+            # Invariance target: the mean of the global views (LeJEPA); local views are pulled to it too.
+            center = proj.mean(dim=1, keepdim=True)
+            if local_views is not None:
+                _, proj_local = model(local_views)
+                proj = torch.cat([proj, proj_local], dim=1)
+            inv_loss = (proj - center).square().mean()
             sig_loss, sig_stats = regularizer(proj)
             ssl_loss = (1.0 - args.lambda_sigreg) * inv_loss + args.lambda_sigreg * sig_loss
             logits = model.probe(emb.detach())
@@ -267,6 +279,8 @@ class BatchStream:
         except StopIteration:
             self._it = iter(self.loader)
             views, _ = next(self._it)
+        if isinstance(views, (tuple, list)):
+            return tuple(v.to(self.device, non_blocking=True) for v in views)
         return views.to(self.device, non_blocking=True)
 
     def window(self, k: int) -> list[torch.Tensor]:
@@ -353,6 +367,8 @@ def main() -> None:
         args.gpu_data = device.type == "cuda" and args.dataset in ("cifar10", "cifar100")
     if args.gpu_data and args.dataset not in ("cifar10", "cifar100"):
         raise SystemExit("--gpu-data supports cifar10 and cifar100 only")
+    if args.local_views and not args.gpu_data:
+        raise SystemExit("--local-views needs --gpu-data")
 
     if args.gpu_data:
         loader_kwargs = dict(
@@ -364,6 +380,10 @@ def main() -> None:
             limit_eval=args.limit_eval,
             download=args.download,
             device=device,
+            global_scale=tuple(args.global_scale),
+            local_views=args.local_views,
+            local_size=args.local_size,
+            local_scale=tuple(args.local_scale),
         )
         train_loader, eval_loader, num_classes, n_train, n_eval = build_gpu_loaders(
             args.dataset, args.data_dir, seed=args.seed, **loader_kwargs

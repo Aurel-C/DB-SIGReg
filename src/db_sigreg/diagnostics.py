@@ -65,9 +65,13 @@ def _flat_grad(loss: Tensor, params: Sequence[nn.Parameter]) -> Tensor:
     return torch.cat([(g if g is not None else torch.zeros_like(p)).reshape(-1) for g, p in zip(grads, params)])
 
 
-def _proj(model: nn.Module, views: Tensor) -> Tensor:
-    _, proj = model(views)
-    return proj.reshape(-1, proj.shape[-1]).float()
+def _proj(model: nn.Module, views: Tensor | tuple[Tensor, Tensor]) -> Tensor:
+    groups = views if isinstance(views, (tuple, list)) else (views,)
+    projs = []
+    for v in groups:
+        _, proj = model(v)
+        projs.append(proj.reshape(-1, proj.shape[-1]).float())
+    return torch.cat(projs)
 
 
 def _window_means(
@@ -101,7 +105,10 @@ def _pseudo_grad(
     With the window's own means this is the exact window gradient.
     """
 
-    total = sum(views.shape[0] * views.shape[1] for views in batches)
+    total = sum(
+        sum(v.shape[0] * v.shape[1] for v in (views if isinstance(views, (tuple, list)) else (views,)))
+        for views in batches
+    )
     grad = None
     for views in batches:
         flat = _proj(model, views)
