@@ -151,7 +151,7 @@ DEFAULT_SEEDS = {"premise": [0], "premise_steps": [0], "fidelity": [0], "smallba
 # agreement, which does not depend on the label set, so CIFAR-10 is enough there.
 DEFAULT_DATASET = {"premise": "cifar100", "premise_steps": "cifar100", "fidelity": "cifar10", "smallbatch": "cifar100", "main": "cifar100", "nullspace": "cifar100"}
 SHORT = {"cifar10": "c10", "cifar100": "c100", "stl10": "stl10", "fake": "fake"}
-DEFAULT_EPOCHS = {"premise": 20, "premise_steps": 1, "fidelity": 5, "smallbatch": 20, "main": 30, "nullspace": 20}
+DEFAULT_EPOCHS = {"premise": 20, "premise_steps": 1, "fidelity": 5, "smallbatch": 20, "main": 20, "nullspace": 20}
 
 
 def done_runs() -> set[str]:
