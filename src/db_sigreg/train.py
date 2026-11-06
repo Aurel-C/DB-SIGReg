@@ -70,6 +70,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-sigreg", type=float, default=0.02)
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--probe-lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--lr-schedule",
+        choices=["constant", "cosine"],
+        default="constant",
+        help="cosine = linear warmup then cosine decay to lr/1000 (LeJEPA's recipe), applied to encoder and projector.",
+    )
+    parser.add_argument("--warmup-frac", type=float, default=0.05, help="Fraction of optimizer steps used for warmup.")
     parser.add_argument("--weight-decay", type=float, default=5e-2)
     parser.add_argument("--probe-weight-decay", type=float, default=1e-7)
     parser.add_argument("--accum-steps", type=int, default=1)
@@ -167,6 +174,8 @@ def train_one_epoch(
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             tracker["optimizer_steps"] += 1
+            if tracker.get("scheduler") is not None:
+                tracker["scheduler"].step()
             if args.total_steps and tracker["optimizer_steps"] >= args.total_steps:
                 break
             if (
@@ -391,6 +400,20 @@ def main() -> None:
             {"params": model.probe.parameters(), "lr": args.probe_lr, "weight_decay": args.probe_weight_decay},
         ]
     )
+    scheduler = None
+    if args.lr_schedule == "cosine":
+        steps_per_epoch = max(len(train_loader) // args.accum_steps, 1)
+        total = args.total_steps or steps_per_epoch * args.epochs
+        warmup = max(int(total * args.warmup_frac), 1)
+
+        def ssl_factor(step: int) -> float:
+            if step < warmup:
+                return (step + 1) / warmup
+            progress = min((step - warmup) / max(total - warmup, 1), 1.0)
+            return 1e-3 + (1 - 1e-3) * 0.5 * (1 + math.cos(math.pi * progress))
+
+        # The online probe keeps a constant lr so it can track the moving features.
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, [ssl_factor, ssl_factor, lambda _: 1.0])
     scaler = GradScaler(device=device.type, enabled=amp_enabled and amp_dtype == torch.float16)
     writer = SummaryWriter(run_dir)
     (run_dir / "config.json").write_text(json.dumps(vars(args), indent=2, default=str) + "\n")
@@ -430,6 +453,7 @@ def main() -> None:
         "iter_samples": 0,
         "peak_memory_mb": 0.0,
         "fidelity": {},
+        "scheduler": scheduler,
     }
     history: list[dict[str, float]] = []
     start_time = time.time()
@@ -494,6 +518,7 @@ def write_results(
     tracker: dict,
     wall_time: float,
 ) -> None:
+    tracker.pop("scheduler", None)
     final = history[-1] if history else {}
     fidelity = {}
     for key, values in tracker["fidelity"].items():
