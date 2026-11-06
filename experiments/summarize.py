@@ -18,6 +18,7 @@ from pathlib import Path
 RESULTS = Path(__file__).resolve().parents[1] / "results" / "runs.jsonl"
 
 COLUMNS = {
+    "fidelity_nomc": None,
     "fidelity": ["fidelity_cos_exact_vs_pop_median", "fidelity_cos_db_vs_pop_median",
                  "fidelity_cos_db_fresh_vs_pop_median", "fidelity_cos_minibatch_vs_pop_median",
                  "fidelity_cos_db_median", "fidelity_cos_minibatch_median", "final_probe_acc"],
@@ -49,7 +50,7 @@ def main() -> None:
         groups[tag][variant].append(run)
 
     for tag, variants in groups.items():
-        cols = COLUMNS.get(tag, DEFAULT)
+        cols = COLUMNS.get(tag) or (COLUMNS["fidelity"] if tag.startswith("fidelity") else DEFAULT)
         print(f"\n### {tag}\n")
         print("| variant | n | " + " | ".join(cols) + " |")
         print("| --- | --- | " + " | ".join("---" for _ in cols) + " |")
