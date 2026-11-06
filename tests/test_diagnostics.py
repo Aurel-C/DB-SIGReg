@@ -56,6 +56,17 @@ class GradientFidelityTest(unittest.TestCase):
         self.assertLess(out["relerr_db"], 1e-4)
         self.assertLess(out["stat_gap_db"], 1e-10)
 
+    def test_population_reference_equals_exact_when_pool_is_the_window(self) -> None:
+        flat = torch.cat([self.model(v)[1].reshape(-1, 4) for v in self.window]).detach()
+        c, s = ecf_sums(flat, self.axes, self.reg.t)
+        out = gradient_fidelity(
+            self.model, self.params, self.window, self.other, self.axes, self.reg.t, self.reg.target,
+            self.reg.weights, c / flat.shape[0], s / flat.shape[0], pool=self.window,
+        )
+        self.assertAlmostEqual(out["cos_exact_vs_pop"], 1.0, places=5)
+        self.assertAlmostEqual(out["cos_db_vs_pop"], 1.0, places=5)
+        self.assertLess(out["stat_gap_window_vs_pop"], 1e-10)
+
     def test_minibatch_is_not_exact(self) -> None:
         out = self.run_fidelity(self.reg.target.expand(3, -1).clone(), torch.zeros(3, 5))
         self.assertLess(out["cos_minibatch"], 0.9999)

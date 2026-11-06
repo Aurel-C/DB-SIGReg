@@ -82,6 +82,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="DB-SIGReg only: every N optimizer steps, compare gradient estimators against the exact window gradient.",
     )
+    parser.add_argument(
+        "--fidelity-pool",
+        type=int,
+        default=4096,
+        help="Images in the independent pool used as the population reference (0 disables it).",
+    )
     parser.add_argument("--metric-axes", type=int, default=256, help="Fixed axes for the eval-set ECF error.")
     return parser.parse_args()
 
@@ -260,6 +266,8 @@ def run_fidelity(
     params = [p for p in list(model.encoder.parameters()) + list(model.projector.parameters()) if p.requires_grad]
     window = stream.window(args.accum_steps)
     independent = stream.window(args.accum_steps)
+    pool_batches = math.ceil(args.fidelity_pool / args.batch_size) if args.fidelity_pool > 0 else 0
+    pool = stream.window(pool_batches) if pool_batches else None
     return gradient_fidelity(
         model,
         params,
@@ -271,6 +279,7 @@ def run_fidelity(
         weights=regularizer.weights.to(device),
         active_cos=regularizer.active_cos,
         active_sin=regularizer.active_sin,
+        pool=pool,
     )
 
 

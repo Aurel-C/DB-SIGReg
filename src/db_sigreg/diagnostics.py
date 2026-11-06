@@ -16,6 +16,14 @@ constants. This module computes, in one fixed projection frame:
 
 All gradients are of the regularizer term only, with respect to the encoder
 and projector parameters.
+
+Two references are reported. ``*_vs_window`` compares against the exact
+gradient of the same window; this favours mini-batch SIGReg, which shares the
+window's samples, while DB's statistics come from other samples. ``*_vs_pop``
+compares against the window's per-sample terms weighted by the ECF error of a
+large independent pool at the current weights (a proxy for the population
+error). It isolates the quality of each estimator's error signal: sampling
+noise, the mini-batch self-correlation bias, and DB's one-step lag.
 """
 
 from __future__ import annotations
@@ -138,6 +146,7 @@ def gradient_fidelity(
     weights: Tensor,
     active_cos: Tensor,
     active_sin: Tensor,
+    pool: Sequence[Tensor] | None = None,
 ) -> dict[str, float]:
     """Compare gradient estimators on one window, in the frame ``axes``.
 
@@ -158,6 +167,11 @@ def gradient_fidelity(
         db_fresh = _pseudo_grad(model, params, window, axes, t, weights, ind_cos - target, ind_sin)
 
         minibatch = _minibatch_grad(model, params, window, axes, t, target, weights)
+
+        reference = None
+        if pool:
+            pop_cos, pop_sin = _window_means(model, pool, axes, t)
+            reference = _pseudo_grad(model, params, window, axes, t, weights, pop_cos - target, pop_sin)
     finally:
         with torch.no_grad():
             for name, b in model.named_buffers():
@@ -170,7 +184,10 @@ def gradient_fidelity(
     def rel(a: Tensor, b: Tensor) -> float:
         return float((a - b).norm() / b.norm().clamp_min(1e-12))
 
-    return {
+    def gap(c: Tensor, s: Tensor, ref_c: Tensor, ref_s: Tensor) -> float:
+        return float((((c - ref_c).square() + (s - ref_s).square()) * weights).sum(-1).mean())
+
+    out = {
         "cos_db": cos(db, exact),
         "cos_db_fresh": cos(db_fresh, exact),
         "cos_minibatch": cos(minibatch, exact),
@@ -181,3 +198,11 @@ def gradient_fidelity(
         "stat_gap_db": float((((active_cos - mean_cos).square() + (active_sin - mean_sin).square()) * weights).sum(-1).mean()),
         "stat_gap_db_fresh": float((((ind_cos - mean_cos).square() + (ind_sin - mean_sin).square()) * weights).sum(-1).mean()),
     }
+    if reference is not None:
+        for name, grad in (("exact", exact), ("db", db), ("db_fresh", db_fresh), ("minibatch", minibatch)):
+            out[f"cos_{name}_vs_pop"] = cos(grad, reference)
+            out[f"relerr_{name}_vs_pop"] = rel(grad, reference)
+        out["stat_gap_db_vs_pop"] = gap(active_cos, active_sin, pop_cos, pop_sin)
+        out["stat_gap_window_vs_pop"] = gap(mean_cos, mean_sin, pop_cos, pop_sin)
+        out["stat_gap_db_fresh_vs_pop"] = gap(ind_cos, ind_sin, pop_cos, pop_sin)
+    return out

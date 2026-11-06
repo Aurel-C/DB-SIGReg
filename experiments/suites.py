@@ -45,15 +45,17 @@ def fidelity(seeds: list[int]) -> list[tuple[str, list[str]]]:
     """Cosine similarity of DB / DB-fresh / mini-batch gradients to the exact window gradient."""
     runs = []
     for seed in seeds:
-        for bs in (16, 64):
-            for k in (1, 4, 16):
-                runs.append(
-                    (
-                        f"fidelity-db-bs{bs}-k{k}-s{seed}",
-                        ["--loss", "dbsigreg", "--batch-size", str(bs), "--accum-steps", str(k),
-                         "--fidelity-every", "20", "--seed", str(seed)],
-                    )
+        configs = [(bs, k, "bn") for bs in (16, 64) for k in (1, 4, 16)]
+        configs += [(4, k, "gn") for k in (16, 64)]  # small micro-batches, batch-independent norms
+        for bs, k, norm in configs:
+            suffix = "" if norm == "bn" else f"-{norm}"
+            runs.append(
+                (
+                    f"fidelity-db-bs{bs}-k{k}{suffix}-s{seed}",
+                    ["--loss", "dbsigreg", "--batch-size", str(bs), "--accum-steps", str(k), "--norm", norm,
+                     "--fidelity-every", "20", "--seed", str(seed)],
                 )
+            )
     return runs
 
 
