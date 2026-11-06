@@ -61,6 +61,9 @@ class GPUViewLoader:
         local_views: int = 0,
         local_size: int = 16,
         local_scale: tuple[float, float] = (0.05, 0.3),
+        jitter: float = 0.4,
+        blur_prob: float = 0.0,
+        solarize_prob: float = 0.0,
     ) -> None:
         self.images = images.to(device).permute(0, 3, 1, 2).contiguous()  # (N, 3, H, W) uint8
         self.labels = labels.to(device)
@@ -71,6 +74,9 @@ class GPUViewLoader:
         self.local_views = local_views
         self.local_size = local_size
         self.local_scale = local_scale
+        self.jitter = jitter  # brightness/contrast/saturation strength; hue = jitter / 4
+        self.blur_prob = blur_prob
+        self.solarize_prob = solarize_prob
         self.train = train
         self.device = device
         self.generator = torch.Generator(device=device).manual_seed(seed)
@@ -128,21 +134,40 @@ class GPUViewLoader:
         grid = F.affine_grid(theta, [n, 3, size, size], align_corners=False)
         x = F.grid_sample(x, grid, mode="bilinear", padding_mode="reflection", align_corners=False)
 
-        # ColorJitter(0.4, 0.4, 0.4, 0.1) with p=0.8.
+        # ColorJitter(j, j, j, j/4) with p=0.8 (j = 0.4 by default, 0.8 in LeJEPA).
+        j = self.jitter
         jitter = (self._rand(n) < 0.8).view(n, 1, 1, 1)
-        y = x * self._rand(n, 0.6, 1.4).view(n, 1, 1, 1)
+        y = x * self._rand(n, max(0.0, 1 - j), 1 + j).view(n, 1, 1, 1)
         gray = (y * self.gray).sum(1, keepdim=True)
         mean = gray.mean(dim=(2, 3), keepdim=True)
-        y = (y - mean) * self._rand(n, 0.6, 1.4).view(n, 1, 1, 1) + mean
+        y = (y - mean) * self._rand(n, max(0.0, 1 - j), 1 + j).view(n, 1, 1, 1) + mean
         gray = (y * self.gray).sum(1, keepdim=True)
-        y = (y - gray) * self._rand(n, 0.6, 1.4).view(n, 1, 1, 1) + gray
-        y = self._hue(y.clamp(0, 1), self._rand(n, -0.1, 0.1))
+        y = (y - gray) * self._rand(n, max(0.0, 1 - j), 1 + j).view(n, 1, 1, 1) + gray
+        y = self._hue(y.clamp(0, 1), self._rand(n, -j / 4, j / 4))
         x = torch.where(jitter, y.clamp(0, 1), x)
 
         # RandomGrayscale(p=0.2).
         gray = (x * self.gray).sum(1, keepdim=True).expand_as(x)
         x = torch.where((self._rand(n) < 0.2).view(n, 1, 1, 1), gray, x)
+        if self.blur_prob > 0:
+            x = torch.where((self._rand(n) < self.blur_prob).view(n, 1, 1, 1), self._blur(x, self._rand(n, 0.1, 2.0)), x)
+        if self.solarize_prob > 0:
+            x = torch.where((self._rand(n) < self.solarize_prob).view(n, 1, 1, 1), torch.where(x < 0.5, x, 1 - x), x)
         return (x - self.mean) / self.std
+
+    @staticmethod
+    def _blur(x: Tensor, sigma: Tensor) -> Tensor:
+        """Per-sample Gaussian blur (separable), sigma in pixels at the output size.
+        torchvision's kernel is 10% of the image size; at 32 px that is ~3, so we use 5 taps."""
+        n, c, h, w = x.shape
+        radius = 2
+        offsets = torch.arange(-radius, radius + 1, device=x.device, dtype=x.dtype)
+        kernel = torch.exp(-0.5 * (offsets.view(1, -1) / sigma.view(-1, 1)) ** 2)
+        kernel = (kernel / kernel.sum(dim=1, keepdim=True)).repeat_interleave(c, dim=0)  # (n*c, k)
+        y = F.pad(x.reshape(1, n * c, h, w), (radius, radius, radius, radius), mode="reflect")
+        y = F.conv2d(y, kernel.view(n * c, 1, 1, -1), groups=n * c)
+        y = F.conv2d(y, kernel.view(n * c, 1, -1, 1), groups=n * c)
+        return y.view(n, c, h, w)
 
     @staticmethod
     def _hue(x: Tensor, shift: Tensor) -> Tensor:
@@ -174,6 +199,9 @@ def build_gpu_loaders(
     local_views: int = 0,
     local_size: int = 16,
     local_scale: tuple[float, float] = (0.05, 0.3),
+    jitter: float = 0.4,
+    blur_prob: float = 0.0,
+    solarize_prob: float = 0.0,
 ) -> tuple[GPUViewLoader, GPUViewLoader, int, int, int]:
     """Returns train loader, eval loader, num classes, train size, eval size."""
 
@@ -197,6 +225,9 @@ def build_gpu_loaders(
         local_views=local_views,
         local_size=local_size,
         local_scale=local_scale,
+        jitter=jitter,
+        blur_prob=blur_prob,
+        solarize_prob=solarize_prob,
     )
     evaluation = GPUViewLoader(
         eval_x, eval_y, batch_size=eval_batch_size, views=1, image_size=image_size, train=False, device=device

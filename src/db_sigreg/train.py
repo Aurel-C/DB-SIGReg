@@ -41,6 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-views", type=int, default=0, help="Extra small multi-crop views (GPU data only).")
     parser.add_argument("--local-size", type=int, default=16)
     parser.add_argument("--local-scale", type=float, nargs=2, default=(0.05, 0.3))
+    parser.add_argument("--jitter", type=float, default=0.4, help="Color-jitter strength (GPU data; LeJEPA uses 0.8).")
+    parser.add_argument("--blur-prob", type=float, default=0.0, help="Gaussian blur probability (GPU data).")
+    parser.add_argument("--solarize-prob", type=float, default=0.0, help="Solarize probability (GPU data).")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=20)
@@ -384,6 +387,9 @@ def main() -> None:
             local_views=args.local_views,
             local_size=args.local_size,
             local_scale=tuple(args.local_scale),
+            jitter=args.jitter,
+            blur_prob=args.blur_prob,
+            solarize_prob=args.solarize_prob,
         )
         train_loader, eval_loader, num_classes, n_train, n_eval = build_gpu_loaders(
             args.dataset, args.data_dir, seed=args.seed, **loader_kwargs
