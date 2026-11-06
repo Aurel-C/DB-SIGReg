@@ -173,7 +173,13 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, nargs="+", default=None)
     parser.add_argument("--dataset", choices=list(SHORT), default=None, help="Override the suite's default dataset.")
     parser.add_argument("--num-workers", type=int, default=4)
-    args, extra = parser.parse_known_args()  # unknown flags are passed to every run
+    argv = sys.argv[1:]
+    passthrough: list[str] = []
+    if "--" in argv:  # everything after "--" goes to every run verbatim
+        cut = argv.index("--")
+        argv, passthrough = argv[:cut], argv[cut + 1 :]
+    args, extra = parser.parse_known_args(argv)  # unknown flags are passed to every run too
+    extra = extra + passthrough
 
     if args.list or not args.suites:
         for name, fn in SUITES.items():
