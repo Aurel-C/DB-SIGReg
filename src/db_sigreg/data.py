@@ -48,6 +48,32 @@ def build_transforms(image_size: int) -> tuple[transforms.Compose, transforms.Co
     return train_transform, eval_transform
 
 
+class NpzImageDataset(Dataset):
+    """CIFAR stored as uint8 arrays (see experiments/fetch_cifar_hf.py)."""
+
+    def __init__(self, path: Path) -> None:
+        import numpy as np
+        from PIL import Image
+
+        data = np.load(path)
+        self._image = Image.fromarray
+        self.images = data["images"]
+        self.labels = data["labels"]
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, index: int):
+        return self._image(self.images[index]), int(self.labels[index])
+
+
+def _npz_pair(root: Path, name: str) -> tuple[Dataset, Dataset] | None:
+    train, test = root / f"{name}-train.npz", root / f"{name}-test.npz"
+    if train.exists() and test.exists():
+        return NpzImageDataset(train), NpzImageDataset(test)
+    return None
+
+
 def _limit(ds: Dataset, limit: int | None) -> Dataset:
     if limit is None or limit <= 0 or limit >= len(ds):
         return ds
@@ -65,7 +91,11 @@ def build_datasets(
 ) -> tuple[Dataset, Dataset, int]:
     root = Path(root)
     train_transform, eval_transform = build_transforms(image_size)
-    if name == "cifar10":
+    npz = _npz_pair(root, name) if name in ("cifar10", "cifar100") else None
+    if npz is not None:
+        train_base, eval_base = npz
+        classes = 10 if name == "cifar10" else 100
+    elif name == "cifar10":
         train_base = datasets.CIFAR10(root, train=True, download=download)
         eval_base = datasets.CIFAR10(root, train=False, download=download)
         classes = 10
