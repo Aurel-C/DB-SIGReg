@@ -1,19 +1,37 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 from torch import Tensor, nn
 from torchvision.models import resnet18
 
 
+Norm = Literal["bn", "gn"]
+
+
+def _norm1d(norm: Norm, dim: int) -> nn.Module:
+    return nn.BatchNorm1d(dim) if norm == "bn" else nn.LayerNorm(dim)
+
+
+def _norm2d(norm: Norm, channels: int) -> nn.Module:
+    if norm == "bn":
+        return nn.BatchNorm2d(channels)
+    return nn.GroupNorm(min(32, channels // 4), channels)
+
+
 class ProjectionHead(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int) -> None:
+    """MLP projector. ``norm="gn"`` swaps BatchNorm for LayerNorm so that
+    outputs do not depend on the micro-batch (needed for small-batch runs)."""
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, norm: Norm = "bn") -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            _norm1d(norm, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            _norm1d(norm, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, out_dim),
         )
@@ -23,26 +41,26 @@ class ProjectionHead(nn.Module):
 
 
 class SmallConvEncoder(nn.Module):
-    def __init__(self, width: int = 64, emb_dim: int = 256) -> None:
+    def __init__(self, width: int = 64, emb_dim: int = 256, norm: Norm = "bn") -> None:
         super().__init__()
         self.features = nn.Sequential(
-            self._block(3, width),
-            self._block(width, width * 2),
-            self._block(width * 2, width * 4),
-            self._block(width * 4, width * 4),
+            self._block(3, width, norm),
+            self._block(width, width * 2, norm),
+            self._block(width * 2, width * 4, norm),
+            self._block(width * 4, width * 4, norm),
             nn.AdaptiveAvgPool2d(1),
         )
         self.fc = nn.Linear(width * 4, emb_dim)
         self.out_dim = emb_dim
 
     @staticmethod
-    def _block(in_ch: int, out_ch: int) -> nn.Sequential:
+    def _block(in_ch: int, out_ch: int, norm: Norm) -> nn.Sequential:
         return nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            _norm2d(norm, out_ch),
             nn.GELU(),
             nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            _norm2d(norm, out_ch),
             nn.GELU(),
             nn.MaxPool2d(2),
         )
@@ -53,9 +71,10 @@ class SmallConvEncoder(nn.Module):
 
 
 class ResNet18Encoder(nn.Module):
-    def __init__(self, emb_dim: int = 512) -> None:
+    def __init__(self, emb_dim: int = 512, norm: Norm = "bn") -> None:
         super().__init__()
-        model = resnet18(weights=None)
+        norm_layer = None if norm == "bn" else (lambda c: _norm2d("gn", c))
+        model = resnet18(weights=None, norm_layer=norm_layer)
         model.fc = nn.Identity()
         self.backbone = model
         self.proj = nn.Linear(512, emb_dim) if emb_dim != 512 else nn.Identity()
@@ -113,17 +132,18 @@ class SSLModel(nn.Module):
         proj_dim: int,
         proj_hidden_dim: int,
         num_classes: int,
+        norm: Norm = "bn",
     ) -> None:
         super().__init__()
         if backbone == "cnn":
-            self.encoder = SmallConvEncoder(emb_dim=emb_dim)
+            self.encoder = SmallConvEncoder(emb_dim=emb_dim, norm=norm)
         elif backbone == "resnet18":
-            self.encoder = ResNet18Encoder(emb_dim=emb_dim)
+            self.encoder = ResNet18Encoder(emb_dim=emb_dim, norm=norm)
         elif backbone == "tiny_vit":
             self.encoder = TinyViTEncoder(image_size=image_size, emb_dim=emb_dim)
         else:
             raise ValueError(f"unknown backbone: {backbone}")
-        self.projector = ProjectionHead(self.encoder.out_dim, proj_hidden_dim, proj_dim)
+        self.projector = ProjectionHead(self.encoder.out_dim, proj_hidden_dim, proj_dim, norm=norm)
         self.probe = nn.Sequential(nn.LayerNorm(self.encoder.out_dim), nn.Linear(self.encoder.out_dim, num_classes))
 
     def forward(self, views: Tensor) -> tuple[Tensor, Tensor]:

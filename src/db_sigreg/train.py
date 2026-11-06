@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from db_sigreg.data import build_datasets
+from db_sigreg.diagnostics import embedding_metrics, gradient_fidelity
 from db_sigreg.models import SSLModel
 from db_sigreg.regularizers import DoubleBufferSIGReg, SIGReg
 
@@ -24,6 +25,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--run-dir", type=Path, default=Path("runs"))
     parser.add_argument("--name", default=None)
+    parser.add_argument("--tag", default=None, help="Experiment suite label stored with the results.")
+    parser.add_argument(
+        "--results-file",
+        type=Path,
+        default=Path("results/runs.jsonl"),
+        help="Tracked JSONL file; one summary line is appended per finished run.",
+    )
     parser.add_argument("--backbone", choices=["cnn", "resnet18", "tiny_vit"], default="cnn")
     parser.add_argument("--loss", choices=["dbsigreg", "sigreg"], default="dbsigreg")
     parser.add_argument("--image-size", type=int, default=64)
@@ -38,7 +46,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proj-dim", type=int, default=64)
     parser.add_argument("--proj-hidden-dim", type=int, default=512)
     parser.add_argument("--axes", type=int, default=128)
-    parser.add_argument("--knots", type=int, default=17)
+    parser.add_argument("--knots", type=int, default=5)
+    parser.add_argument(
+        "--sigreg-refresh",
+        type=int,
+        default=1,
+        help="SIGReg only: redraw axes every N forward passes; 0 keeps them fixed forever.",
+    )
+    parser.add_argument("--norm", choices=["bn", "gn"], default="bn", help="gn = GroupNorm/LayerNorm, batch-independent.")
     parser.add_argument("--lambda-sigreg", type=float, default=0.02)
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--probe-lr", type=float, default=1e-3)
@@ -54,6 +69,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument(
+        "--fidelity-every",
+        type=int,
+        default=0,
+        help="DB-SIGReg only: every N optimizer steps, compare gradient estimators against the exact window gradient.",
+    )
+    parser.add_argument("--metric-axes", type=int, default=256, help="Fixed axes for the eval-set ECF error.")
     return parser.parse_args()
 
 
@@ -90,6 +112,8 @@ def train_one_epoch(
     amp_dtype: torch.dtype,
     epoch: int,
     global_step: int,
+    tracker: dict,
+    fidelity_stream: "BatchStream | None" = None,
 ) -> int:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -121,12 +145,30 @@ def train_one_epoch(
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            tracker["optimizer_steps"] += 1
+            if (
+                fidelity_stream is not None
+                and isinstance(regularizer, DoubleBufferSIGReg)
+                and regularizer.mature
+                and tracker["optimizer_steps"] % args.fidelity_every == 0
+            ):
+                fid = run_fidelity(model, regularizer, fidelity_stream, args, device)
+                for key, value in fid.items():
+                    writer.add_scalar(f"fidelity/{key}", value, global_step)
+                    tracker["fidelity"].setdefault(key, []).append(value)
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         iter_time = time.perf_counter() - iter_start
         samples_per_sec = labels.shape[0] / max(iter_time, 1e-9)
         global_step += 1
+        if global_step > 10:  # skip warm-up iterations (cudnn autotune, worker start)
+            tracker["iter_time"] += iter_time
+            tracker["iter_samples"] += labels.shape[0]
+        if device.type == "cuda":
+            tracker["peak_memory_mb"] = max(
+                tracker["peak_memory_mb"], torch.cuda.max_memory_allocated(device) / 1024**2
+            )
 
         if global_step % args.log_every == 0 or step == 1:
             elapsed = time.perf_counter() - last_log
@@ -154,6 +196,50 @@ def train_one_epoch(
     return global_step
 
 
+class BatchStream:
+    """Endless iterator over a DataLoader, used to draw fidelity windows."""
+
+    def __init__(self, loader: DataLoader, device: torch.device) -> None:
+        self.loader = loader
+        self.device = device
+        self._it = iter(loader)
+
+    def next(self) -> torch.Tensor:
+        try:
+            views, _ = next(self._it)
+        except StopIteration:
+            self._it = iter(self.loader)
+            views, _ = next(self._it)
+        return views.to(self.device, non_blocking=True)
+
+    def window(self, k: int) -> list[torch.Tensor]:
+        return [self.next() for _ in range(k)]
+
+
+def run_fidelity(
+    model: nn.Module,
+    regularizer: DoubleBufferSIGReg,
+    stream: BatchStream,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> dict[str, float]:
+    params = [p for p in list(model.encoder.parameters()) + list(model.projector.parameters()) if p.requires_grad]
+    window = stream.window(args.accum_steps)
+    independent = stream.window(args.accum_steps)
+    return gradient_fidelity(
+        model,
+        params,
+        window,
+        independent,
+        axes=regularizer.active_axes,
+        t=regularizer.t.to(device),
+        target=regularizer.target.to(device),
+        weights=regularizer.weights.to(device),
+        active_cos=regularizer.active_cos,
+        active_sin=regularizer.active_sin,
+    )
+
+
 @torch.inference_mode()
 def evaluate(
     model: nn.Module,
@@ -163,21 +249,34 @@ def evaluate(
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     epoch: int,
-) -> float:
+    metric_axes: torch.Tensor,
+    metric_reg: nn.Module,
+) -> dict[str, float]:
     model.eval()
     correct = 0
     total = 0
+    projections = []
     for views, labels in loader:
         views = views.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         with autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-            emb, _ = model(views)
+            emb, proj = model(views)
             logits = model.probe(emb)
         correct += (logits.argmax(dim=1) == labels).sum().item()
         total += labels.numel()
+        projections.append(proj.reshape(-1, proj.shape[-1]).float())
     acc = correct / max(total, 1)
-    writer.add_scalar("eval/probe_acc", acc, epoch)
-    return acc
+    metrics = embedding_metrics(
+        torch.cat(projections),
+        metric_axes,
+        metric_reg.t.to(device),
+        metric_reg.target.to(device),
+        metric_reg.weights.to(device),
+    )
+    metrics["probe_acc"] = acc
+    for key, value in metrics.items():
+        writer.add_scalar(f"eval/{key}", value, epoch)
+    return metrics
 
 
 def main() -> None:
@@ -224,12 +323,13 @@ def main() -> None:
         proj_dim=args.proj_dim,
         proj_hidden_dim=args.proj_hidden_dim,
         num_classes=num_classes,
+        norm=args.norm,
     ).to(device)
     if args.compile:
         model = torch.compile(model)
 
     if args.loss == "sigreg":
-        regularizer: nn.Module = SIGReg(axes=args.axes, knots=args.knots).to(device)
+        regularizer: nn.Module = SIGReg(axes=args.axes, knots=args.knots, refresh_every=args.sigreg_refresh).to(device)
     else:
         regularizer = DoubleBufferSIGReg(
             axes=args.axes,
@@ -256,6 +356,34 @@ def main() -> None:
     if args.loss == "dbsigreg" and args.db_stat_mode == "detached" and args.swap_steps != args.accum_steps:
         print("Note: DB-SIGReg is easiest to interpret when --swap-steps equals --accum-steps.")
 
+    fidelity_stream = None
+    if args.fidelity_every > 0 and args.loss == "dbsigreg":
+        fidelity_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=min(args.num_workers, 2),
+            pin_memory=device.type == "cuda",
+            persistent_workers=args.num_workers > 0,
+        )
+        fidelity_stream = BatchStream(fidelity_loader, device)
+
+    # Fixed, seeded axes so the eval-set ECF error is comparable across runs.
+    metric_reg = SIGReg(axes=args.metric_axes, knots=args.knots)
+    gen = torch.Generator().manual_seed(1234)
+    metric_axes = torch.randn(args.proj_dim, args.metric_axes, generator=gen)
+    metric_axes = (metric_axes / metric_axes.norm(dim=0, keepdim=True)).to(device)
+
+    tracker: dict = {
+        "optimizer_steps": 0,
+        "iter_time": 0.0,
+        "iter_samples": 0,
+        "peak_memory_mb": 0.0,
+        "fidelity": {},
+    }
+    history: list[dict[str, float]] = []
+    start_time = time.time()
     global_step = 0
     best_acc = -math.inf
     try:
@@ -273,11 +401,20 @@ def main() -> None:
                 amp_dtype=amp_dtype,
                 epoch=epoch,
                 global_step=global_step,
+                tracker=tracker,
+                fidelity_stream=fidelity_stream,
             )
-            if epoch % args.eval_every == 0:
-                acc = evaluate(model, eval_loader, writer, device, amp_enabled, amp_dtype, epoch)
+            if epoch % args.eval_every == 0 or epoch == args.epochs:
+                metrics = evaluate(
+                    model, eval_loader, writer, device, amp_enabled, amp_dtype, epoch, metric_axes, metric_reg
+                )
+                acc = metrics["probe_acc"]
                 best_acc = max(best_acc, acc)
-                print(f"epoch={epoch:03d} eval/probe_acc={acc:.4f} best={best_acc:.4f}")
+                history.append({"epoch": epoch, **metrics})
+                print(
+                    f"epoch={epoch:03d} probe_acc={acc:.4f} best={best_acc:.4f} "
+                    f"ecf_error={metrics['ecf_error']:.5f} axis_std={metrics['axis_std']:.4f}"
+                )
             checkpoint = {
                 "model": model.state_dict(),
                 "regularizer": regularizer.state_dict(),
@@ -290,6 +427,42 @@ def main() -> None:
             torch.save(checkpoint, run_dir / "last.pt")
     finally:
         writer.close()
+
+    write_results(args, run_dir, history, tracker, time.time() - start_time)
+
+
+def write_results(
+    args: argparse.Namespace,
+    run_dir: Path,
+    history: list[dict[str, float]],
+    tracker: dict,
+    wall_time: float,
+) -> None:
+    final = history[-1] if history else {}
+    fidelity = {f"fidelity_{k}_mean": sum(v) / len(v) for k, v in tracker["fidelity"].items() if v}
+    summary = {
+        "run": run_dir.name,
+        "tag": args.tag,
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "final_probe_acc": final.get("probe_acc"),
+        "best_probe_acc": max((h["probe_acc"] for h in history), default=None),
+        "final_ecf_error": final.get("ecf_error"),
+        "final_axis_std": final.get("axis_std"),
+        "final_dim_std": final.get("dim_std"),
+        "samples_per_sec": tracker["iter_samples"] / tracker["iter_time"] if tracker["iter_time"] else None,
+        "peak_memory_mb": tracker["peak_memory_mb"] or None,
+        "optimizer_steps": tracker["optimizer_steps"],
+        "wall_time_sec": wall_time,
+        **fidelity,
+        "history": history,
+        "fidelity_trace": tracker["fidelity"],
+        "config": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    args.results_file.parent.mkdir(parents=True, exist_ok=True)
+    with args.results_file.open("a") as fh:
+        fh.write(json.dumps(summary) + "\n")
+    print(f"Appended summary to {args.results_file}")
 
 
 if __name__ == "__main__":

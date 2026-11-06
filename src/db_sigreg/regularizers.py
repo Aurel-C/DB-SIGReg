@@ -29,13 +29,21 @@ def _make_axes(dim: int, axes: int, device: torch.device, dtype: torch.dtype) ->
 class SIGReg(nn.Module):
     """LeJEPA-style sketched isotropic Gaussian regularization.
 
-    This recomputes random projection axes every forward pass and estimates the
-    empirical characteristic function from the current mini-batch.
+    By default this recomputes random projection axes every forward pass and
+    estimates the empirical characteristic function from the current mini-batch.
+    ``refresh_every`` > 1 keeps the same axes for that many forward passes, and
+    ``refresh_every`` = 0 draws them once and keeps them forever (the fixed-axes
+    ablation used to probe the null-space trap).
     """
 
-    def __init__(self, axes: int = 256, knots: int = 17, t_max: float = 3.0) -> None:
+    def __init__(self, axes: int = 256, knots: int = 17, t_max: float = 3.0, refresh_every: int = 1) -> None:
         super().__init__()
+        if refresh_every < 0:
+            raise ValueError("refresh_every must be >= 0")
         self.axes = axes
+        self.refresh_every = refresh_every
+        self._fixed_axes: Tensor | None = None
+        self._forwards = 0
         t = torch.linspace(0.0, t_max, knots, dtype=torch.float32)
         dt = t_max / (knots - 1)
         weights = torch.full((knots,), 2.0 * dt, dtype=torch.float32)
@@ -47,7 +55,7 @@ class SIGReg(nn.Module):
 
     def forward(self, z: Tensor) -> tuple[Tensor, RegularizerStats]:
         flat = z.reshape(-1, z.shape[-1]).float()
-        axes = _make_axes(flat.shape[-1], self.axes, flat.device, flat.dtype)
+        axes = self._axes_for(flat)
         projected = flat @ axes
         theta = projected.unsqueeze(-1) * self.t.to(projected.device)
         cos_mean = theta.cos().mean(dim=0)
@@ -66,6 +74,16 @@ class SIGReg(nn.Module):
             mature=True,
         )
         return loss, stats
+
+    def _axes_for(self, flat: Tensor) -> Tensor:
+        dim = flat.shape[-1]
+        stale = self._fixed_axes is None or self._fixed_axes.shape[0] != dim or self._fixed_axes.device != flat.device
+        if self.refresh_every > 0 and self._forwards % self.refresh_every == 0:
+            stale = True
+        if stale:
+            self._fixed_axes = _make_axes(dim, self.axes, flat.device, flat.dtype)
+        self._forwards += 1
+        return self._fixed_axes
 
 
 class DoubleBufferSIGReg(nn.Module):

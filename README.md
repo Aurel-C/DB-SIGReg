@@ -81,11 +81,39 @@ Useful metrics:
 - `perf/samples_per_sec`, `perf/iter_time_sec`, `perf/peak_memory_mb`: speed and memory comparison.
 - `buffer/active_count`, `buffer/shadow_count`, `buffer/swaps`, `buffer/mature`: DB-SIGReg buffer health.
 
+### Experiment suites
+
+`experiments/suites.py` runs the paper's experiments on CIFAR-10 (32 px, small CNN, 5 knots).
+Every finished run appends a summary line to `results/runs.jsonl`, which is tracked in git,
+and runs already listed there are skipped on restart.
+
+```bash
+uv run python experiments/suites.py --list               # suites and run counts
+uv run python experiments/suites.py fidelity premise     # run suites in order
+uv run python experiments/suites.py main --epochs 50 -- --backbone resnet18   # extra flags go to every run
+uv run python experiments/summarize.py                   # Markdown tables per suite
+```
+
+| Suite | Question |
+| --- | --- |
+| `premise` | Does plain SIGReg degrade as the batch shrinks (32 to 512, no accumulation)? |
+| `fidelity` | How close are the DB-SIGReg and mini-batch SIGReg gradients to the exact window gradient? |
+| `smallbatch` | SIGReg vs DB-SIGReg with micro-batches of 2 to 32 at 256 images per step, with batch-independent norms (`--norm gn`). |
+| `main` | Equal memory (64 × 4) comparison against a true batch-256 SIGReg ceiling, 3 seeds. |
+| `nullspace` | Fixed vs rotating axes, and DB swap intervals, with 16 and 128 axes on a 64-dim projector. |
+
+The gradient-fidelity diagnostic (`--fidelity-every N`, DB-SIGReg only) computes the exact
+large-batch gradient of the window in two passes with micro-batch memory, and logs the cosine
+similarity of three estimators against it: DB-SIGReg (lagged statistics), DB-SIGReg with
+statistics from an independent window at the current weights (no lag), and mini-batch SIGReg
+with accumulation. Each eval also logs the eval-set ECF error and per-axis std in fixed axes.
+
 ## 🚀 Roadmap / Next Steps
 - [x] Formulate math and architectural geometry.
 - [x] Publish initial whitepaper draft.
 - [x] Implement PyTorch module with `.detach()` shadow updates.
-- [x] Run empirical baseline on small-scale datasets.
+- [x] Run empirical baseline on small-scale datasets (results not kept).
+- [ ] Run the experiment suites and write the experiments section.
 
 ## 📖 Citation
 If you find this theoretical framework useful, please consider citing:
