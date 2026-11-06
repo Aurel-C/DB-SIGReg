@@ -8,9 +8,12 @@ from torchvision.models import resnet18
 
 
 Norm = Literal["bn", "gn"]
+ProjNorm = Literal["bn", "gn", "none"]
 
 
-def _norm1d(norm: Norm, dim: int) -> nn.Module:
+def _norm1d(norm: ProjNorm, dim: int) -> nn.Module:
+    if norm == "none":
+        return nn.Identity()
     return nn.BatchNorm1d(dim) if norm == "bn" else nn.LayerNorm(dim)
 
 
@@ -22,9 +25,10 @@ def _norm2d(norm: Norm, channels: int) -> nn.Module:
 
 class ProjectionHead(nn.Module):
     """MLP projector. ``norm="gn"`` swaps BatchNorm for LayerNorm so that
-    outputs do not depend on the micro-batch (needed for small-batch runs)."""
+    outputs do not depend on the micro-batch (needed for small-batch runs);
+    ``norm="none"`` drops the norm layers entirely."""
 
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, norm: Norm = "bn") -> None:
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, norm: ProjNorm = "bn") -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -137,6 +141,7 @@ class SSLModel(nn.Module):
         proj_hidden_dim: int,
         num_classes: int,
         norm: Norm = "bn",
+        proj_norm: ProjNorm | None = None,
     ) -> None:
         super().__init__()
         if backbone == "cnn":
@@ -147,7 +152,9 @@ class SSLModel(nn.Module):
             self.encoder = TinyViTEncoder(image_size=image_size, emb_dim=emb_dim)
         else:
             raise ValueError(f"unknown backbone: {backbone}")
-        self.projector = ProjectionHead(self.encoder.out_dim, proj_hidden_dim, proj_dim, norm=norm)
+        self.projector = ProjectionHead(
+            self.encoder.out_dim, proj_hidden_dim, proj_dim, norm=norm if proj_norm is None else proj_norm
+        )
         self.probe = nn.Sequential(nn.LayerNorm(self.encoder.out_dim), nn.Linear(self.encoder.out_dim, num_classes))
 
     def forward(self, views: Tensor) -> tuple[Tensor, Tensor]:

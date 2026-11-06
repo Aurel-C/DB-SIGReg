@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--emb-dim", type=int, default=256)
     parser.add_argument("--proj-dim", type=int, default=64)
     parser.add_argument("--proj-hidden-dim", type=int, default=512)
+    parser.add_argument(
+        "--proj-norm",
+        choices=["same", "none"],
+        default="same",
+        help="Projector norm layers: same as --norm, or none (no norm in the projector).",
+    )
     parser.add_argument("--axes", type=int, default=128)
     parser.add_argument("--knots", type=int, default=5)
     parser.add_argument(
@@ -75,6 +81,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--norm", choices=["bn", "gn"], default="bn", help="gn = GroupNorm/LayerNorm, batch-independent.")
     parser.add_argument("--lambda-sigreg", type=float, default=0.02)
+    parser.add_argument(
+        "--inv-warmup-steps",
+        type=int,
+        default=0,
+        help="Optimizer steps at the start with invariance weight 0 (SIGReg-only warmup).",
+    )
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--probe-lr", type=float, default=1e-3)
     parser.add_argument(
@@ -173,7 +185,8 @@ def train_one_epoch(
                 proj = torch.cat([proj, proj_local], dim=1)
             inv_loss = (proj - center).square().mean()
             sig_loss, sig_stats = regularizer(proj)
-            ssl_loss = (1.0 - args.lambda_sigreg) * inv_loss + args.lambda_sigreg * sig_loss
+            inv_weight = 0.0 if tracker["optimizer_steps"] < args.inv_warmup_steps else 1.0 - args.lambda_sigreg
+            ssl_loss = inv_weight * inv_loss + args.lambda_sigreg * sig_loss
             logits = model.probe(emb.detach())
             repeated_labels = labels.repeat_interleave(args.views)
             probe_loss = F.cross_entropy(logits, repeated_labels)
@@ -405,6 +418,7 @@ def main() -> None:
         proj_hidden_dim=args.proj_hidden_dim,
         num_classes=num_classes,
         norm=args.norm,
+        proj_norm=None if args.proj_norm == "same" else args.proj_norm,
     ).to(device)
     if args.compile:
         model = torch.compile(model)

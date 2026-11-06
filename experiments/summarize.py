@@ -3,7 +3,8 @@
     uv run python experiments/summarize.py            # all suites
     uv run python experiments/summarize.py fidelity   # one suite
 
-Seeds are averaged (mean ± std when there is more than one).
+Seeds are averaged (mean ± std when there is more than one). Runs whose final
+eval axis_std is below COLLAPSED_AXIS_STD are marked "(collapsed)".
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ COLUMNS = {
                  "fidelity_cos_db_fresh_vs_pop_median", "fidelity_cos_minibatch_vs_pop_median",
                  "fidelity_cos_db_median", "fidelity_cos_minibatch_median", "final_probe_acc"],
 }
+COLLAPSED_AXIS_STD = 0.1
 DEFAULT = ["final_probe_acc", "best_probe_acc", "final_ecf_error", "final_axis_std", "samples_per_sec", "peak_memory_mb"]
 
 
@@ -47,6 +49,8 @@ def main() -> None:
         if wanted and tag not in wanted:
             continue
         variant = re.sub(r"-s\d+(?=-|$)", "", run["config"]["name"] or run["run"])
+        if (run.get("final_axis_std") or 0.0) < COLLAPSED_AXIS_STD:
+            variant += " (collapsed)"
         groups[tag][variant].append(run)
 
     for tag, variants in groups.items():
