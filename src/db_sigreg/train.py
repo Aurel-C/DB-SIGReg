@@ -15,6 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from db_sigreg.data import build_datasets
 from db_sigreg.diagnostics import embedding_metrics, gradient_fidelity
+from db_sigreg.gpu_data import build_gpu_loaders
 from db_sigreg.models import SSLModel
 from db_sigreg.regularizers import DoubleBufferSIGReg, SIGReg
 
@@ -42,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-train", type=int, default=None)
     parser.add_argument("--limit-eval", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument(
+        "--gpu-data",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Keep CIFAR on the GPU and augment there (default: on for CIFAR when running on CUDA).",
+    )
     parser.add_argument("--emb-dim", type=int, default=256)
     parser.add_argument("--proj-dim", type=int, default=64)
     parser.add_argument("--proj-hidden-dim", type=int, default=512)
@@ -117,14 +124,16 @@ def train_one_epoch(
 ) -> int:
     model.train()
     optimizer.zero_grad(set_to_none=True)
+    # Timing is measured over log intervals with one sync each, so the CPU can
+    # keep queueing work while the GPU runs (no per-step synchronize).
+    _sync(device)
     last_log = time.perf_counter()
+    samples_since_log = 0
+    steps_since_log = 0
 
     for step, (views, labels) in enumerate(train_loader, start=1):
-        iter_start = time.perf_counter()
         views = views.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
 
         with autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
             emb, proj = model(views)
@@ -157,28 +166,27 @@ def train_one_epoch(
                     writer.add_scalar(f"fidelity/{key}", value, global_step)
                     tracker["fidelity"].setdefault(key, []).append(value)
 
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        iter_time = time.perf_counter() - iter_start
-        samples_per_sec = labels.shape[0] / max(iter_time, 1e-9)
         global_step += 1
-        if global_step > 10:  # skip warm-up iterations (cudnn autotune, worker start)
-            tracker["iter_time"] += iter_time
-            tracker["iter_samples"] += labels.shape[0]
-        if device.type == "cuda":
-            tracker["peak_memory_mb"] = max(
-                tracker["peak_memory_mb"], torch.cuda.max_memory_allocated(device) / 1024**2
-            )
+        samples_since_log += labels.shape[0]
+        steps_since_log += 1
 
         if global_step % args.log_every == 0 or step == 1:
+            _sync(device)
             elapsed = time.perf_counter() - last_log
+            iter_time = elapsed / steps_since_log
+            samples_per_sec = samples_since_log / max(elapsed, 1e-9)
+            if global_step > args.log_every:  # skip warm-up (cudnn autotune, compile, worker start)
+                tracker["iter_time"] += elapsed
+                tracker["iter_samples"] += samples_since_log
+            samples_since_log = 0
+            steps_since_log = 0
             writer.add_scalar("train/loss", loss.item() * args.accum_steps, global_step)
             writer.add_scalar("train/ssl_loss", ssl_loss.item(), global_step)
             writer.add_scalar("train/invariance_loss", inv_loss.item(), global_step)
             writer.add_scalar("train/sigreg_loss", sig_loss.item(), global_step)
-            writer.add_scalar("train/sigreg_metric", sig_stats.loss_metric, global_step)
-            writer.add_scalar("train/sigreg_ecf_error", sig_stats.ecf_error, global_step)
-            writer.add_scalar("train/sigreg_optimization_loss", sig_stats.optimization_loss, global_step)
+            writer.add_scalar("train/sigreg_metric", float(sig_stats.loss_metric), global_step)
+            writer.add_scalar("train/sigreg_ecf_error", float(sig_stats.ecf_error), global_step)
+            writer.add_scalar("train/sigreg_optimization_loss", float(sig_stats.optimization_loss), global_step)
             writer.add_scalar("train/probe_loss", probe_loss.item(), global_step)
             writer.add_scalar("buffer/loss_count", sig_stats.loss_count, global_step)
             writer.add_scalar("buffer/active_count", sig_stats.active_count, global_step)
@@ -190,10 +198,36 @@ def train_one_epoch(
             writer.add_scalar("perf/log_interval_sec", elapsed, global_step)
             if device.type == "cuda":
                 peak_mb = torch.cuda.max_memory_allocated(device) / 1024**2
+                tracker["peak_memory_mb"] = max(tracker["peak_memory_mb"], peak_mb)
                 writer.add_scalar("perf/peak_memory_mb", peak_mb, global_step)
             last_log = time.perf_counter()
 
     return global_step
+
+
+def build_cpu_loaders(args: argparse.Namespace, device: torch.device):
+    train_ds, eval_ds, num_classes = build_datasets(
+        args.dataset,
+        args.data_dir,
+        args.image_size,
+        args.views,
+        args.limit_train,
+        args.limit_eval,
+        args.download,
+    )
+    common = dict(
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+    )
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True, **common)
+    eval_loader = DataLoader(eval_ds, batch_size=args.eval_batch_size, shuffle=False, **common)
+    return train_loader, eval_loader, num_classes, len(train_ds), len(eval_ds)
+
+
+def _sync(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 class BatchStream:
@@ -289,32 +323,27 @@ def main() -> None:
     amp_enabled, amp_dtype = choose_amp(device, args.amp)
     run_dir = make_run_dir(args)
 
-    train_ds, eval_ds, num_classes = build_datasets(
-        args.dataset,
-        args.data_dir,
-        args.image_size,
-        args.views,
-        args.limit_train,
-        args.limit_eval,
-        args.download,
-    )
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=args.num_workers > 0,
-    )
-    eval_loader = DataLoader(
-        eval_ds,
-        batch_size=args.eval_batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=args.num_workers > 0,
-    )
+    if args.gpu_data is None:
+        args.gpu_data = device.type == "cuda" and args.dataset in ("cifar10", "cifar100")
+    if args.gpu_data and args.dataset not in ("cifar10", "cifar100"):
+        raise SystemExit("--gpu-data supports cifar10 and cifar100 only")
+
+    if args.gpu_data:
+        loader_kwargs = dict(
+            batch_size=args.batch_size,
+            eval_batch_size=args.eval_batch_size,
+            views=args.views,
+            image_size=args.image_size,
+            limit_train=args.limit_train,
+            limit_eval=args.limit_eval,
+            download=args.download,
+            device=device,
+        )
+        train_loader, eval_loader, num_classes, n_train, n_eval = build_gpu_loaders(
+            args.dataset, args.data_dir, seed=args.seed, **loader_kwargs
+        )
+    else:
+        train_loader, eval_loader, num_classes, n_train, n_eval = build_cpu_loaders(args, device)
 
     model = SSLModel(
         backbone=args.backbone,
@@ -351,22 +380,25 @@ def main() -> None:
 
     print(f"Run directory: {run_dir}")
     print(f"Device: {device} | AMP: {amp_dtype if amp_enabled else 'off'}")
-    print(f"Train samples: {len(train_ds)} | Eval samples: {len(eval_ds)}")
+    print(f"Train samples: {n_train} | Eval samples: {n_eval} | Data on GPU: {args.gpu_data}")
     print(f"Effective optimizer batch: {args.batch_size * args.accum_steps}")
     if args.loss == "dbsigreg" and args.db_stat_mode == "detached" and args.swap_steps != args.accum_steps:
         print("Note: DB-SIGReg is easiest to interpret when --swap-steps equals --accum-steps.")
 
     fidelity_stream = None
     if args.fidelity_every > 0 and args.loss == "dbsigreg":
-        fidelity_loader = DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=min(args.num_workers, 2),
-            pin_memory=device.type == "cuda",
-            persistent_workers=args.num_workers > 0,
-        )
+        if args.gpu_data:
+            fidelity_loader, *_ = build_gpu_loaders(args.dataset, args.data_dir, seed=args.seed + 1, **loader_kwargs)
+        else:
+            fidelity_loader = DataLoader(
+                train_loader.dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                drop_last=True,
+                num_workers=min(args.num_workers, 2),
+                pin_memory=device.type == "cuda",
+                persistent_workers=args.num_workers > 0,
+            )
         fidelity_stream = BatchStream(fidelity_loader, device)
 
     # Fixed, seeded axes so the eval-set ECF error is comparable across runs.
@@ -439,7 +471,12 @@ def write_results(
     wall_time: float,
 ) -> None:
     final = history[-1] if history else {}
-    fidelity = {f"fidelity_{k}_mean": sum(v) / len(v) for k, v in tracker["fidelity"].items() if v}
+    fidelity = {}
+    for key, values in tracker["fidelity"].items():
+        if values:
+            ordered = sorted(values)
+            fidelity[f"fidelity_{key}_mean"] = sum(values) / len(values)
+            fidelity[f"fidelity_{key}_median"] = ordered[len(ordered) // 2]
     summary = {
         "run": run_dir.name,
         "tag": args.tag,

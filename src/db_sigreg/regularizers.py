@@ -11,9 +11,12 @@ DBStatMode = Literal["detached", "include_current"]
 
 @dataclass
 class RegularizerStats:
-    loss_metric: float
-    ecf_error: float
-    optimization_loss: float
+    """Per-step diagnostics. Loss values are detached 0-d tensors so that the
+    training loop only pays a GPU sync when it actually logs them."""
+
+    loss_metric: Tensor
+    ecf_error: Tensor
+    optimization_loss: Tensor
     loss_count: int
     active_count: int
     shadow_count: int
@@ -64,9 +67,9 @@ class SIGReg(nn.Module):
         ecf_error = (err * self.weights.to(projected.device)).sum(dim=-1).mean()
         loss = ecf_error * flat.shape[0]
         stats = RegularizerStats(
-            loss_metric=float(loss.detach().cpu()),
-            ecf_error=float(ecf_error.detach().cpu()),
-            optimization_loss=float(loss.detach().cpu()),
+            loss_metric=loss.detach(),
+            ecf_error=ecf_error.detach(),
+            optimization_loss=loss.detach(),
             loss_count=flat.shape[0],
             active_count=flat.shape[0],
             shadow_count=0,
@@ -133,25 +136,43 @@ class DoubleBufferSIGReg(nn.Module):
         self.register_buffer("step_tensor", torch.tensor(0, dtype=torch.long))
         self.register_buffer("swap_tensor", torch.tensor(0, dtype=torch.long))
 
+        # Host-side mirrors of the counter buffers: reading a CUDA tensor with
+        # .item() forces a GPU sync, so the hot path only uses these.
+        self._active_n = 0
+        self._shadow_n = 0
+        self._step_n = 0
+        self._swap_n = 0
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs) -> None:  # type: ignore[override]
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        self.sync_counters_from_buffers()
+
+    def sync_counters_from_buffers(self) -> None:
+        """Refresh the host-side counters after writing the counter buffers directly."""
+        self._active_n = int(self.active_count_tensor.item())
+        self._shadow_n = int(self.shadow_count_tensor.item())
+        self._step_n = int(self.step_tensor.item())
+        self._swap_n = int(self.swap_tensor.item())
+
     @property
     def active_count(self) -> int:
-        return int(self.active_count_tensor.item())
+        return self._active_n
 
     @property
     def shadow_count(self) -> int:
-        return int(self.shadow_count_tensor.item())
+        return self._shadow_n
 
     @property
     def swaps(self) -> int:
-        return int(self.swap_tensor.item())
+        return self._swap_n
 
     @property
     def mature(self) -> bool:
-        return self.active_count > 0
+        return self._active_n > 0
 
     @property
     def ready_to_swap(self) -> bool:
-        return int(self.step_tensor.item()) >= self.swap_steps and self.shadow_count > 0
+        return self._step_n >= self.swap_steps and self._shadow_n > 0
 
     def _init_state(self, dim: int, device: torch.device, dtype: torch.dtype) -> None:
         stat_shape = (self.axes, self.t.numel())
@@ -168,6 +189,7 @@ class DoubleBufferSIGReg(nn.Module):
         self.shadow_count_tensor = torch.tensor(0, device=device, dtype=torch.long)
         self.step_tensor = torch.tensor(0, device=device, dtype=torch.long)
         self.swap_tensor = torch.tensor(0, device=device, dtype=torch.long)
+        self._active_n = self._shadow_n = self._step_n = self._swap_n = 0
 
     def forward(self, z: Tensor) -> tuple[Tensor, RegularizerStats]:
         flat = z.reshape(-1, z.shape[-1]).float()
@@ -191,19 +213,15 @@ class DoubleBufferSIGReg(nn.Module):
             err = (cos_mean - target).square() + sin_mean.square()
             pseudo_loss = (err * weights).sum(dim=-1).mean() * total_count
             metric_loss = pseudo_loss.detach()
-            ecf_error = float((metric_loss / total_count).cpu())
+            ecf_error = metric_loss / total_count
         else:
             cos_err = (self.active_cos - target).detach()
             sin_err = self.active_sin.detach()
             pseudo = cos_err.unsqueeze(0) * theta.cos() + sin_err.unsqueeze(0) * theta.sin()
             pseudo_loss = self.gradient_scale * flat.shape[0] * (pseudo * weights).sum(dim=-1).mean()
-            ecf_error = self._active_error().item()
+            ecf_error = self._active_error().detach()
             total_count = max(self.active_count, 1)
-            metric_loss = torch.as_tensor(
-                ecf_error * total_count,
-                device=flat.device,
-                dtype=pseudo_loss.dtype,
-            )
+            metric_loss = (ecf_error * total_count).to(pseudo_loss.dtype)
 
         with torch.no_grad():
             shadow_projected = flat.detach() @ self.shadow_axes
@@ -212,14 +230,15 @@ class DoubleBufferSIGReg(nn.Module):
             self.shadow_sin_sum.add_(shadow_theta.sin().sum(dim=0))
             self.shadow_count_tensor.add_(flat.shape[0])
             self.step_tensor.add_(1)
-            loss_metric = float(metric_loss.cpu())
+        self._shadow_n += flat.shape[0]
+        self._step_n += 1
 
         loss = metric_loss.detach() + pseudo_loss - pseudo_loss.detach()
 
         stats = RegularizerStats(
-            loss_metric=float(loss_metric),
-            ecf_error=float(ecf_error),
-            optimization_loss=float(pseudo_loss.detach().cpu()),
+            loss_metric=metric_loss.detach(),
+            ecf_error=ecf_error,
+            optimization_loss=pseudo_loss.detach(),
             loss_count=int(total_count),
             active_count=self.active_count,
             shadow_count=self.shadow_count,
@@ -254,6 +273,10 @@ class DoubleBufferSIGReg(nn.Module):
             self.shadow_count_tensor.zero_()
             self.step_tensor.zero_()
             self.swap_tensor.add_(1)
+        self._active_n = self._shadow_n
+        self._shadow_n = 0
+        self._step_n = 0
+        self._swap_n += 1
         return True
 
     def after_optimizer_step(self) -> bool:

@@ -54,6 +54,7 @@ class DoubleBufferSIGRegTest(unittest.TestCase):
             regularizer.active_sin.copy_(theta.sin().mean(dim=0))
             regularizer.active_count_tensor.fill_(num_samples)
 
+        regularizer.sync_counters_from_buffers()
         db_loss, db_stats = regularizer(z)
         db_loss.backward()
         db_grad = z.grad.detach().clone()
@@ -62,8 +63,8 @@ class DoubleBufferSIGRegTest(unittest.TestCase):
         direct_loss = direct_sigreg_loss(z_direct, projection_axes, regularizer)
         direct_loss.backward()
 
-        self.assertAlmostEqual(db_stats.loss_metric, float(direct_loss.detach()), places=5)
-        self.assertAlmostEqual(db_stats.ecf_error, float(direct_loss.detach() / num_samples), places=5)
+        self.assertAlmostEqual(float(db_stats.loss_metric), float(direct_loss.detach()), places=5)
+        self.assertAlmostEqual(float(db_stats.ecf_error), float(direct_loss.detach() / num_samples), places=5)
         torch.testing.assert_close(db_grad, z_direct.grad, rtol=1e-5, atol=1e-6)
 
     def test_include_current_mode_matches_combined_previous_and_current_objective(self) -> None:
@@ -85,6 +86,7 @@ class DoubleBufferSIGRegTest(unittest.TestCase):
             regularizer.active_cos.copy_(regularizer.active_cos_sum / prev_samples)
             regularizer.active_sin.copy_(regularizer.active_sin_sum / prev_samples)
 
+        regularizer.sync_counters_from_buffers()
         db_loss, db_stats = regularizer(current)
         db_loss.backward()
         db_grad = current.grad.detach().clone()
@@ -96,8 +98,8 @@ class DoubleBufferSIGRegTest(unittest.TestCase):
 
         self.assertEqual(db_stats.loss_count, prev_samples + current_samples)
         self.assertEqual(db_stats.active_count, prev_samples)
-        self.assertAlmostEqual(db_stats.loss_metric, float(direct_loss.detach()), places=5)
-        self.assertAlmostEqual(db_stats.ecf_error, float(direct_loss.detach() / (prev_samples + current_samples)), places=5)
+        self.assertAlmostEqual(float(db_stats.loss_metric), float(direct_loss.detach()), places=5)
+        self.assertAlmostEqual(float(db_stats.ecf_error), float(direct_loss.detach() / (prev_samples + current_samples)), places=5)
         torch.testing.assert_close(db_grad, current_direct.grad, rtol=1e-5, atol=1e-6)
 
     def test_include_current_does_not_append_current_batch_to_active_buffer(self) -> None:
@@ -113,6 +115,7 @@ class DoubleBufferSIGRegTest(unittest.TestCase):
             regularizer.active_sin_sum.copy_(active_sin_sum)
             regularizer.active_count_tensor.fill_(prev_samples)
 
+        regularizer.sync_counters_from_buffers()
         _, stats = regularizer(torch.randn(current_samples, dim))
 
         self.assertEqual(stats.loss_count, prev_samples + current_samples)

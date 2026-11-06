@@ -18,8 +18,9 @@ from pathlib import Path
 RESULTS = Path(__file__).resolve().parents[1] / "results" / "runs.jsonl"
 
 COLUMNS = {
-    "fidelity": ["fidelity_cos_db_mean", "fidelity_cos_db_fresh_mean", "fidelity_cos_minibatch_mean",
-                 "fidelity_relerr_db_mean", "fidelity_relerr_minibatch_mean", "final_probe_acc"],
+    "fidelity": ["fidelity_cos_db_median", "fidelity_cos_db_fresh_median", "fidelity_cos_minibatch_median",
+                 "fidelity_cos_db_mean", "fidelity_relerr_db_median", "fidelity_relerr_minibatch_median",
+                 "final_probe_acc", "samples_per_sec"],
 }
 DEFAULT = ["final_probe_acc", "best_probe_acc", "final_ecf_error", "final_axis_std", "samples_per_sec", "peak_memory_mb"]
 
